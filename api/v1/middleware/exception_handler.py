@@ -160,15 +160,19 @@ async def operational_error_handler(request: Request, exc: OperationalError):
 async def starlette_http_exception_handler(
     request: Request, exc: StarletteHTTPException
 ):
-    message = exc.detail if exc.detail else "Not Found"
-    if exc.status_code == 404:
-        message = "Resource not found"
-    elif exc.status_code == 405:
-        message = "Method not allowed"
-    elif exc.status_code == 403:
-        message = "Forbidden"
-    elif exc.status_code == 401:
-        message = "Unauthorized"
+    if exc.detail:
+        message = exc.detail
+    else:
+        if exc.status_code == 404:
+            message = "Resource not found"
+        elif exc.status_code == 405:
+            message = "Method not allowed"
+        elif exc.status_code == 403:
+            message = "Forbidden"
+        elif exc.status_code == 401:
+            message = "Unauthorized"
+        else:
+            message = "An error occurred"
 
     request_id = getattr(request.state, "request_id", None)
     log_level = "warning" if exc.status_code < 500 else "error"

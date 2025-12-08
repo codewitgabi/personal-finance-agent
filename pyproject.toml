@@ -13,6 +13,7 @@ dependencies = [
     "langchain-google-vertexai>=3.1.1",
     "motor>=3.7.1",
     "psycopg2>=2.9.11",
+    "pydantic[email]>=2.12.5",
     "pyjwt>=2.10.1",
     "python-dotenv>=1.2.1",
     "python-json-logger>=4.0.0",

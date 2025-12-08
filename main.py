@@ -10,6 +10,7 @@ from api.v1.responses.success_response import success_response
 from api.v1.utils.database import Base, engine
 from api.v1.utils.logger import setup_logger
 from api.v1.middleware.logging_middleware import LoggingMiddleware
+from api.v1.routes import version_one
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from api.v1.middleware.exception_handler import (
     validation_exception_handler,
@@ -57,6 +58,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(version_one)
 
 
 @app.get("/")
