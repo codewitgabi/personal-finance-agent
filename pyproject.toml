@@ -1,0 +1,19 @@
+[project]
+name = "langchain-tutorial"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "alembic>=1.17.2",
+    "fastapi>=0.124.0",
+    "langchain>=1.1.2",
+    "langchain-google-genai>=3.2.0",
+    "langchain-google-vertexai>=3.1.1",
+    "motor>=3.7.1",
+    "psycopg2>=2.9.11",
+    "python-dotenv>=1.2.1",
+    "python-json-logger>=4.0.0",
+    "sqlalchemy>=2.0.44",
+    "uvicorn>=0.38.0",
+]
