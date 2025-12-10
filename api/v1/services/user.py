@@ -1,4 +1,5 @@
-from typing import Annotated
+from typing import Annotated, Optional
+from decimal import Decimal
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
@@ -24,6 +25,74 @@ class UserService:
 
     def get_user_by_id(self, user_id: str, db: Session) -> User | None:
         return db.scalar(select(User).where(User.id == user_id))
+
+    def update_user_profile(
+        self,
+        user_id: str,
+        monthly_income: Optional[Decimal] = None,
+        savings_goal: Optional[Decimal] = None,
+        currency: Optional[str] = None,
+        db: Session = None,
+    ) -> Optional[User]:
+        user = self.get_user_by_id(user_id, db)
+        if not user:
+            return None
+
+        if monthly_income is not None:
+            user.monthly_income = monthly_income
+        if savings_goal is not None:
+            user.savings_goal = savings_goal
+        if currency is not None:
+            user.currency = currency
+
+        db.commit()
+        db.refresh(user)
+
+        logger.info(
+            "User profile updated",
+            extra={
+                "user_id": user_id,
+                "monthly_income": str(monthly_income) if monthly_income else None,
+                "savings_goal": str(savings_goal) if savings_goal else None,
+                "currency": currency,
+            },
+        )
+
+        return user
+
+    def update_user_profile(
+        self,
+        user_id: str,
+        monthly_income: Optional[Decimal] = None,
+        savings_goal: Optional[Decimal] = None,
+        currency: Optional[str] = None,
+        db: Session = None,
+    ) -> Optional[User]:
+        user = self.get_user_by_id(user_id, db)
+        if not user:
+            return None
+
+        if monthly_income is not None:
+            user.monthly_income = monthly_income
+        if savings_goal is not None:
+            user.savings_goal = savings_goal
+        if currency is not None:
+            user.currency = currency
+
+        db.commit()
+        db.refresh(user)
+
+        logger.info(
+            "User profile updated",
+            extra={
+                "user_id": user_id,
+                "monthly_income": str(monthly_income) if monthly_income else None,
+                "savings_goal": str(savings_goal) if savings_goal else None,
+                "currency": currency,
+            },
+        )
+
+        return user
 
     def get_current_user(
         self,

@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI Chat Stream Test</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          Oxygen, Ubuntu, Cantarell, sans-serif;
+        background: #f5f5f5;
+        padding: 20px;
+      }
+
+      .container {
+        max-width: 900px;
+        margin: 0 auto;
+        background: white;
+        border-radius: 8px;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+        padding: 30px;
+      }
+
+      h1 {
+        color: #333;
+        margin-bottom: 20px;
+      }
+
+      .form-group {
+        margin-bottom: 15px;
+      }
+
+      label {
+        display: block;
+        margin-bottom: 5px;
+        color: #555;
+        font-weight: 500;
+      }
+
+      input,
+      textarea {
+        width: 100%;
+        padding: 10px;
+        border: 1px solid #ddd;
+        border-radius: 4px;
+        font-size: 14px;
+      }
+
+      textarea {
+        min-height: 100px;
+        resize: vertical;
+        font-family: inherit;
+      }
+
+      button {
+        background: #007bff;
+        color: white;
+        border: none;
+        padding: 12px 24px;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 16px;
+        font-weight: 500;
+      }
+
+      button:hover {
+        background: #0056b3;
+      }
+
+      button:disabled {
+        background: #ccc;
+        cursor: not-allowed;
+      }
+
+      .output {
+        margin-top: 30px;
+        padding: 20px;
+        background: #f8f9fa;
+        border-radius: 4px;
+        border: 1px solid #e9ecef;
+        min-height: 200px;
+        max-height: 500px;
+        overflow-y: auto;
+      }
+
+      .event {
+        margin-bottom: 15px;
+        padding: 10px;
+        background: white;
+        border-radius: 4px;
+        border-left: 4px solid #007bff;
+      }
+
+      .event-type {
+        font-weight: 600;
+        color: #007bff;
+        margin-bottom: 5px;
+      }
+
+      .event-data {
+        color: #333;
+        font-size: 13px;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+
+      .event.update {
+        border-left-color: #28a745;
+      }
+
+      .event.update .event-type {
+        color: #28a745;
+      }
+
+      .event.custom {
+        border-left-color: #ffc107;
+      }
+
+      .event.custom .event-type {
+        color: #ffc107;
+      }
+
+      .event.done {
+        border-left-color: #6c757d;
+      }
+
+      .event.done .event-type {
+        color: #6c757d;
+      }
+
+      .event.error {
+        border-left-color: #dc3545;
+      }
+
+      .event.error .event-type {
+        color: #dc3545;
+      }
+
+      .status {
+        margin-top: 10px;
+        padding: 10px;
+        border-radius: 4px;
+        font-size: 14px;
+      }
+
+      .status.connected {
+        background: #d4edda;
+        color: #155724;
+      }
+
+      .status.disconnected {
+        background: #f8d7da;
+        color: #721c24;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>AI Chat Stream Test</h1>
+
+      <form id="chatForm">
+        <div class="form-group">
+          <label for="token">Access Token:</label>
+          <input
+            type="text"
+            id="token"
+            placeholder="Enter your access token"
+            required
+          />
+        </div>
+
+        <div class="form-group">
+          <label for="threadId">Thread ID (optional):</label>
+          <input
+            type="text"
+            id="threadId"
+            placeholder="Leave empty for new conversation"
+          />
+        </div>
+
+        <div class="form-group">
+          <label for="message">Message:</label>
+          <textarea
+            id="message"
+            placeholder="Enter your message here..."
+            required
+          ></textarea>
+        </div>
+
+        <button type="submit" id="submitBtn">Send Message</button>
+        <button
+          type="button"
+          id="clearBtn"
+          style="background: #6c757d; margin-left: 10px"
+        >
+          Clear Output
+        </button>
+      </form>
+
+      <div id="status" class="status disconnected" style="display: none"></div>
+
+      <div class="output" id="output"></div>
+    </div>
+
+    <script>
+      const form = document.getElementById("chatForm");
+      const output = document.getElementById("output");
+      const statusDiv = document.getElementById("status");
+      const submitBtn = document.getElementById("submitBtn");
+      const clearBtn = document.getElementById("clearBtn");
+      let eventSource = null;
+
+      const API_URL = "http://localhost:5001/api/v1/ai/chat";
+
+      function addEvent(type, data) {
+        const eventDiv = document.createElement("div");
+        eventDiv.className = `event ${type}`;
+
+        const typeDiv = document.createElement("div");
+        typeDiv.className = "event-type";
+        typeDiv.textContent = `Type: ${type.toUpperCase()}`;
+
+        const dataDiv = document.createElement("div");
+        dataDiv.className = "event-data";
+        dataDiv.textContent = JSON.stringify(data, null, 2);
+
+        eventDiv.appendChild(typeDiv);
+        eventDiv.appendChild(dataDiv);
+        output.appendChild(eventDiv);
+
+        output.scrollTop = output.scrollHeight;
+      }
+
+      function updateStatus(message, isConnected) {
+        statusDiv.textContent = message;
+        statusDiv.className = `status ${
+          isConnected ? "connected" : "disconnected"
+        }`;
+        statusDiv.style.display = "block";
+      }
+
+      clearBtn.addEventListener("click", () => {
+        output.innerHTML = "";
+        statusDiv.style.display = "none";
+      });
+
+      form.addEventListener("submit", async (e) => {
+        e.preventDefault();
+
+        const token = document.getElementById("token").value;
+        const message = document.getElementById("message").value;
+        const threadId = document.getElementById("threadId").value;
+
+        if (!token || !message) {
+          alert("Please provide both token and message");
+          return;
+        }
+
+        submitBtn.disabled = true;
+        output.innerHTML = "";
+        updateStatus("Connecting...", false);
+
+        try {
+          const response = await fetch(API_URL, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({
+              message: message,
+              thread_id: threadId,
+            }),
+          });
+
+          if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+          }
+
+          updateStatus("Streaming...", true);
+
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = "";
+
+          while (true) {
+            const { done, value } = await reader.read();
+
+            if (done) {
+              updateStatus("Stream completed", false);
+              break;
+            }
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop();
+
+            for (const line of lines) {
+              if (line.startsWith("data: ")) {
+                try {
+                  const data = JSON.parse(line.slice(6));
+                  addEvent(data.type, data.data || data);
+                } catch (err) {
+                  console.error("Error parsing SSE data:", err);
+                }
+              }
+            }
+          }
+        } catch (error) {
+          updateStatus(`Error: ${error.message}`, false);
+          addEvent("error", { message: error.message });
+        } finally {
+          submitBtn.disabled = false;
+        }
+      });
+    </script>
+  </body>
+</html>
