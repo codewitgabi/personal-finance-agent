@@ -1,4 +1,5 @@
 import os
+from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,6 +21,7 @@ from api.v1.middleware.exception_handler import (
     starlette_http_exception_handler,
     general_exception_handler,
 )
+from ai.agent import ensure_checkpointer_setup
 
 load_dotenv()
 
@@ -30,11 +32,22 @@ setup_logger()
 
 Base.metadata.create_all(bind=engine)
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: Initialize checkpointer
+    await ensure_checkpointer_setup()
+    yield
+    # Shutdown: Cleanup if needed
+    pass
+
+
 app: FastAPI = FastAPI(
     debug=os.environ.get("DEBUG") != "False",
     docs_url="/docs",
     redoc_url=None,
     title="Fastapi Langchain API",
+    lifespan=lifespan,
 )
 
 app.add_middleware(LoggingMiddleware)

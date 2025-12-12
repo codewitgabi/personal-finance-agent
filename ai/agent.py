@@ -1,9 +1,19 @@
 import os
+import asyncio
+import traceback
 from langchain.chat_models import init_chat_model
 from langchain.agents import create_agent
 from langgraph.checkpoint.postgres import PostgresSaver
-from langgraph.checkpoint.memory import InMemorySaver
-from ai.tools import categorize_transaction, create_budget_rule, save_user_profile
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from typing import Optional, Any
+from ai.tools import (
+    categorize_transaction,
+    create_budget_rule,
+    save_user_profile,
+    get_user_transactions,
+    get_user_budget_rules,
+    get_spending_summary,
+)
 
 
 SYSTEM_PROMPT = """
@@ -115,6 +125,9 @@ Your categorization must follow standard categories such as:
   Example: "Limit my food spending to 60k monthly"
 
 ## When analyzing spending:
+- Use `get_user_transactions` to retrieve transaction history
+- Use `get_spending_summary` to get spending totals by category
+- Use `get_user_budget_rules` to retrieve current budget limits
 - Aggregate by category
 - Compare against budget limits
 - Detect overspending
@@ -146,11 +159,17 @@ Provide insights like:
 # 9. SYSTEM CONTEXT
 ---------------------------------------------------------------
 You have access to:
-- User profile (salary, preferences, budgets)
-- User transactions
-- Budget rules
-- Categorized spending summaries
+- User profile (salary, preferences, budgets) via `save_user_profile`
+- User transactions via `get_user_transactions`
+- Budget rules via `get_user_budget_rules`
+- Categorized spending summaries via `get_spending_summary`
 (through tools provided by the backend)
+
+When the user asks about their spending, transactions, or budgets:
+- Use `get_user_transactions` to see transaction history
+- Use `get_spending_summary` to analyze spending by category
+- Use `get_user_budget_rules` to check current budget limits
+- Then provide informed analysis based on the actual data
 
 Never mention this internal context unless the user explicitly asks.
 
@@ -171,15 +190,121 @@ Always behave like a reliable financial assistant.
 model = init_chat_model(
     "gemini-2.5-flash", temperature=0.8, timeout=10, max_tokens=1000
 )
-checkpointer = InMemorySaver()
 DB_URI = os.environ.get("DATABASE_URL")
+
+
+# Async adapter for PostgresSaver to make it work with async operations
+class AsyncPostgresSaverAdapter(BaseCheckpointSaver):
+    """Adapter to make sync PostgresSaver work with async operations."""
+
+    def __init__(self, sync_saver: PostgresSaver):
+        self._sync_saver = sync_saver
+
+    async def setup(self):
+        """Setup tables - run sync setup in thread pool."""
+        await asyncio.to_thread(self._sync_saver.setup)
+
+    async def aget_tuple(self, config: dict) -> Optional[Any]:
+        """Get checkpoint tuple - run sync get in thread pool."""
+        return await asyncio.to_thread(self._sync_saver.get_tuple, config)
+
+    async def aput_writes(self, config: dict, writes: list, task_id: str):
+        """Put writes - run sync put in thread pool."""
+        await asyncio.to_thread(self._sync_saver.put_writes, config, writes, task_id)
+
+    async def aput(
+        self,
+        config: dict,
+        checkpoint: Any,
+        metadata: dict,
+        new_versions: dict,
+    ):
+        """Put checkpoint - run sync put in thread pool."""
+        await asyncio.to_thread(
+            self._sync_saver.put, config, checkpoint, metadata, new_versions
+        )
+
+    async def alist(
+        self,
+        config: dict,
+        filter: Optional[dict] = None,
+        before: Optional[str] = None,
+        limit: Optional[int] = None,
+    ):
+        """List checkpoints - run sync list in thread pool."""
+        return await asyncio.to_thread(
+            self._sync_saver.list, config, filter, before, limit
+        )
+
+    # Delegate other methods to sync saver
+    def get_tuple(self, config: dict):
+        return self._sync_saver.get_tuple(config)
+
+    def put_writes(self, config: dict, writes: list, task_id: str):
+        return self._sync_saver.put_writes(config, writes, task_id)
+
+    def put(self, config: dict, checkpoint: Any, metadata: dict, new_versions: dict):
+        return self._sync_saver.put(config, checkpoint, metadata, new_versions)
+
+    def list(
+        self,
+        config: dict,
+        filter: Optional[dict] = None,
+        before: Optional[str] = None,
+        limit: Optional[int] = None,
+    ):
+        return self._sync_saver.list(config, filter, before, limit)
+
+    def __getattr__(self, name: str):
+        """Delegate any other attributes/methods to the sync saver."""
+        return getattr(self._sync_saver, name)
+
+
+# Initialize PostgresSaver for persistent agent memory
+checkpointer = None
+_checkpointer_cm = None
+_checkpointer_setup_done = False
+
+if DB_URI:
+    try:
+        # Initialize sync PostgresSaver
+        _checkpointer_cm = PostgresSaver.from_conn_string(DB_URI)
+        sync_saver = _checkpointer_cm.__enter__()
+        sync_saver.setup()  # Setup tables synchronously
+
+        # Wrap it in async adapter
+        checkpointer = AsyncPostgresSaverAdapter(sync_saver)
+        _checkpointer_setup_done = True
+    except Exception as e:
+        error_msg = f"Failed to initialize PostgresSaver checkpointer: {str(e)}"
+        traceback.print_exc()
+        raise ValueError(error_msg)
+else:
+    raise ValueError(
+        "DATABASE_URL environment variable is required for agent persistence"
+    )
+
+
+async def ensure_checkpointer_setup():
+    """Ensure the checkpointer is set up. Call this from FastAPI startup."""
+    global _checkpointer_setup_done
+    if not _checkpointer_setup_done and checkpointer:
+        await checkpointer.setup()
+        _checkpointer_setup_done = True
 
 
 def get_agent():
     agent = create_agent(
         model=model,
         system_prompt=SYSTEM_PROMPT,
-        tools=[categorize_transaction, create_budget_rule, save_user_profile],
+        tools=[
+            categorize_transaction,
+            create_budget_rule,
+            save_user_profile,
+            get_user_transactions,
+            get_user_budget_rules,
+            get_spending_summary,
+        ],
         checkpointer=checkpointer,
     )
 

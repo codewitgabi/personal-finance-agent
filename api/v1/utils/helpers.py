@@ -1,6 +1,8 @@
 import json
 import uuid
 import time
+import traceback
+from api.v1.utils.logger import get_logger
 from typing import AsyncGenerator, Any, Optional
 from langchain_core.messages import HumanMessage
 from ai.agent import get_agent, model
@@ -318,68 +320,105 @@ async def stream_agent_response(
         user_message_id = user_message.id
 
         set_user_context(user_id, db)
-        agent = get_agent()
+
+        # Get agent with error handling
+        try:
+            agent = get_agent()
+        except Exception as agent_error:
+            error_msg = f"Failed to initialize agent: {str(agent_error)}"
+            logger = get_logger("stream_agent_response")
+            logger.error(error_msg, exc_info=True)
+            error_data = {
+                "message": error_msg,
+                "thread_id": final_thread_id,
+                "title": "New Conversation",
+            }
+            yield format_sse_event({"type": "error", "data": error_data})
+            return
+
         config = {"configurable": {"thread_id": final_thread_id}}
 
-        async for event in agent.astream(
-            {"messages": [("user", message)]},
-            config=config,
-            stream_mode=["updates", "custom", "messages"],
-        ):
-            if isinstance(event, tuple) and len(event) == 2:
-                mode, data = event
+        try:
+            stream = agent.astream(
+                {"messages": [("user", message)]},
+                config=config,
+                stream_mode=["updates", "custom", "messages"],
+            )
+        except Exception as stream_init_error:
+            error_msg = f"Failed to start agent stream: {str(stream_init_error) or repr(stream_init_error)}"
+            logger = get_logger("stream_agent_response")
+            logger.error(error_msg, exc_info=True)
+            error_data = {
+                "message": error_msg,
+                "thread_id": final_thread_id,
+                "title": "New Conversation",
+            }
+            yield format_sse_event({"type": "error", "data": error_data})
+            return
 
-                # Handle token-by-token streaming from messages mode
-                if mode == "messages":
-                    message_chunk, metadata = data
-                    if hasattr(message_chunk, "content") and message_chunk.content:
-                        # Extract text content
-                        chunk_text = extract_text_from_message(message_chunk)
-                        if chunk_text:
-                            assistant_content += chunk_text
+        try:
+            async for event in stream:
+                if isinstance(event, tuple) and len(event) == 2:
+                    mode, data = event
 
-                            # Create assistant message if it doesn't exist
-                            if assistant_message_id is None:
-                                assistant_message = chat_message_service.create_message(
-                                    conversation_id=conversation_id,
-                                    role=MessageRole.ASSISTANT,
-                                    content=assistant_content,
-                                    parent_message_id=user_message_id,
-                                    model=MODEL_NAME,
-                                    temperature=MODEL_TEMPERATURE,
-                                    status=MessageStatus.PENDING,
-                                    db=db,
-                                )
-                                assistant_message_id = assistant_message.id
-                            else:
-                                # Update existing message with accumulated content
-                                chat_message_service.update_message(
-                                    message_id=assistant_message_id,
-                                    content=assistant_content,
-                                    db=db,
-                                )
+                    # Handle token-by-token streaming from messages mode
+                    if mode == "messages":
+                        message_chunk, metadata = data
+                        if hasattr(message_chunk, "content") and message_chunk.content:
+                            # Extract text content
+                            chunk_text = extract_text_from_message(message_chunk)
+                            if chunk_text:
+                                assistant_content += chunk_text
 
-                        yield format_sse_event(
-                            {"type": "text", "content": message_chunk.content}
-                        )
+                                # Create assistant message if it doesn't exist
+                                if assistant_message_id is None:
+                                    assistant_message = (
+                                        chat_message_service.create_message(
+                                            conversation_id=conversation_id,
+                                            role=MessageRole.ASSISTANT,
+                                            content=assistant_content,
+                                            parent_message_id=user_message_id,
+                                            model=MODEL_NAME,
+                                            temperature=MODEL_TEMPERATURE,
+                                            status=MessageStatus.PENDING,
+                                            db=db,
+                                        )
+                                    )
+                                    assistant_message_id = assistant_message.id
+                                else:
+                                    # Update existing message with accumulated content
+                                    chat_message_service.update_message(
+                                        message_id=assistant_message_id,
+                                        content=assistant_content,
+                                        db=db,
+                                    )
 
-                # Handle node updates for tool calls
-                elif mode == "updates" and isinstance(data, dict):
-                    for node_name, node_data in data.items():
-                        if not isinstance(node_data, dict):
-                            continue
-
-                        tool_info = extract_tool_info(node_name, node_data)
-                        if tool_info:
-                            # Track tool calls for metadata
-                            tool_calls.append({"node": node_name, "info": tool_info})
                             yield format_sse_event(
-                                {"type": "tool_update", "content": tool_info}
+                                {"type": "text", "content": message_chunk.content}
                             )
 
-                # Handle custom events if you emit any
-                elif mode == "custom":
-                    yield format_sse_event({"type": "custom", "content": data})
+                    # Handle node updates for tool calls
+                    elif mode == "updates" and isinstance(data, dict):
+                        for node_name, node_data in data.items():
+                            if not isinstance(node_data, dict):
+                                continue
+
+                            tool_info = extract_tool_info(node_name, node_data)
+                            if tool_info:
+                                # Track tool calls for metadata
+                                tool_calls.append(
+                                    {"node": node_name, "info": tool_info}
+                                )
+                                yield format_sse_event(
+                                    {"type": "tool_update", "content": tool_info}
+                                )
+
+                    # Handle custom events if you emit any
+                    elif mode == "custom":
+                        yield format_sse_event({"type": "custom", "content": data})
+        except Exception as stream_error:
+            # Re-raise to be caught by outer exception handler
+            raise
 
         # Calculate latency
         latency_ms = int((time.time() - start_time) * 1000)
@@ -465,6 +504,21 @@ async def stream_agent_response(
             }
         )
     except Exception as e:
+        logger = get_logger("stream_agent_response")
+        error_message = str(e) if str(e) else repr(e)
+        error_traceback = traceback.format_exc()
+
+        # Log the full error for debugging
+        logger.error(
+            f"Error in stream_agent_response: {error_message}",
+            extra={
+                "traceback": error_traceback,
+                "user_id": user_id,
+                "thread_id": final_thread_id,
+            },
+            exc_info=True,
+        )
+
         # Update assistant message status to error if it exists
         if assistant_message_id:
             try:
@@ -472,14 +526,17 @@ async def stream_agent_response(
                     message_id=assistant_message_id,
                     status=MessageStatus.ERROR,
                     finish_reason=FinishReason.ERROR,
-                    message_metadata={"error": str(e)},
+                    message_metadata={
+                        "error": error_message,
+                        "traceback": error_traceback,
+                    },
                     db=db,
                 )
-            except:
-                pass  # Don't fail if update fails
+            except Exception as update_error:
+                logger.error(f"Failed to update message status: {str(update_error)}")
 
         # Try to get conversation info for error response
-        error_data = {"message": str(e)}
+        error_data = {"message": error_message or "An unknown error occurred"}
         if conversation_id:
             try:
                 conversation = conversation_service.get_conversation_by_id(
@@ -491,7 +548,8 @@ async def stream_agent_response(
                 else:
                     error_data["thread_id"] = final_thread_id
                     error_data["title"] = "New Conversation"
-            except:
+            except Exception as conv_error:
+                logger.error(f"Failed to get conversation: {str(conv_error)}")
                 # If we can't get conversation, at least include thread_id
                 error_data["thread_id"] = final_thread_id
                 error_data["title"] = "New Conversation"

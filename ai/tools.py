@@ -16,11 +16,13 @@ logger = get_logger("ai_tools")
 
 _user_context = {}
 _db_session = None
+_external_db_session = None  # Track if session was passed from outside
 
 
 def set_user_context(user_id: str, db: Session = None):
-    global _user_context, _db_session
+    global _user_context, _db_session, _external_db_session
     _user_context["user_id"] = user_id
+    _external_db_session = db  # Track if session was passed from outside
     _db_session = db or SessionLocal()
 
 
@@ -156,8 +158,9 @@ def categorize_transaction(transaction: str) -> str:
         )
         return f"Error processing transaction: {str(e)}"
     finally:
-        global _db_session
-        if _db_session:
+        global _db_session, _external_db_session
+        # Only close the session if we created it ourselves (not passed from outside)
+        if _db_session and _db_session is not _external_db_session:
             _db_session.close()
             _db_session = None
 
@@ -220,8 +223,9 @@ def create_budget_rule(limit_amount: float, period: str) -> str:
         )
         return f"Error creating budget rule: {str(e)}"
     finally:
-        global _db_session
-        if _db_session:
+        global _db_session, _external_db_session
+        # Only close the session if we created it ourselves (not passed from outside)
+        if _db_session and _db_session is not _external_db_session:
             _db_session.close()
             _db_session = None
 
@@ -295,10 +299,187 @@ def save_user_profile(
         )
         return f"Error updating profile: {str(e)}"
     finally:
-        global _db_session
-        if _db_session:
+        global _db_session, _external_db_session
+        # Only close the session if we created it ourselves (not passed from outside)
+        if _db_session and _db_session is not _external_db_session:
             _db_session.close()
             _db_session = None
 
 
-TOOL_NAMES = ["categorize_transaction", "create_budget_rule", "save_user_profile"]
+@tool
+def get_user_transactions(limit: Optional[int] = 10) -> str:
+    """
+    Retrieve the user's transaction history from the database.
+
+    Args:
+        limit: Optional number of transactions to return (default: 10). Use a higher number for more history.
+
+    Returns:
+        A formatted summary of recent transactions with amounts, categories, types, and dates.
+    """
+    writer = get_stream_writer()
+    writer(f"Retrieving user transactions (limit: {limit})")
+
+    if "user_id" not in _user_context:
+        return "Error: User context not set. Please authenticate first."
+
+    db = get_db_session()
+    user_id = _user_context["user_id"]
+
+    try:
+        writer("Fetching transactions from database")
+        transactions = transaction_service.get_user_transactions(
+            user_id=user_id, db=db, limit=limit
+        )
+
+        if not transactions:
+            writer("No transactions found")
+            return "No transactions found in your history."
+
+        writer(f"Found {len(transactions)} transactions")
+
+        result_lines = [f"Transaction History ({len(transactions)} transactions):\n"]
+        for i, txn in enumerate(transactions, 1):
+            category = txn.ai_category or "Uncategorized"
+            date_str = (
+                txn.created_at.strftime("%Y-%m-%d %H:%M")
+                if txn.created_at
+                else "Unknown date"
+            )
+            result_lines.append(
+                f"{i}. {txn.type.value.upper()}: {txn.amount} - {category} ({date_str})"
+            )
+
+        result = "\n".join(result_lines)
+        writer("Transactions retrieved successfully")
+        return result
+
+    except Exception as e:
+        logger.error(
+            "Error retrieving transactions", extra={"error": str(e)}, exc_info=True
+        )
+        return f"Error retrieving transactions: {str(e)}"
+    finally:
+        global _db_session, _external_db_session
+        # Only close the session if we created it ourselves (not passed from outside)
+        if _db_session and _db_session is not _external_db_session:
+            _db_session.close()
+            _db_session = None
+
+
+@tool
+def get_user_budget_rules() -> str:
+    """
+    Retrieve the user's budget rules from the database.
+
+    Returns:
+        A formatted list of all budget rules with limits, periods, and next reset dates.
+    """
+    writer = get_stream_writer()
+    writer("Retrieving user budget rules")
+
+    if "user_id" not in _user_context:
+        return "Error: User context not set. Please authenticate first."
+
+    db = get_db_session()
+    user_id = _user_context["user_id"]
+
+    try:
+        writer("Fetching budget rules from database")
+        budget_rules = budget_service.get_user_budget_rules(user_id=user_id, db=db)
+
+        if not budget_rules:
+            writer("No budget rules found")
+            return "No budget rules found. You can create one using the create_budget_rule tool."
+
+        writer(f"Found {len(budget_rules)} budget rules")
+
+        result_lines = [f"Budget Rules ({len(budget_rules)} active):\n"]
+        for i, rule in enumerate(budget_rules, 1):
+            reset_date_str = (
+                rule.next_reset_date.strftime("%Y-%m-%d")
+                if rule.next_reset_date
+                else "Unknown"
+            )
+            result_lines.append(
+                f"{i}. Limit: {rule.limit_amount} per {rule.period.value} | Next reset: {reset_date_str}"
+            )
+
+        result = "\n".join(result_lines)
+        writer("Budget rules retrieved successfully")
+        return result
+
+    except Exception as e:
+        logger.error(
+            "Error retrieving budget rules", extra={"error": str(e)}, exc_info=True
+        )
+        return f"Error retrieving budget rules: {str(e)}"
+    finally:
+        global _db_session, _external_db_session
+        # Only close the session if we created it ourselves (not passed from outside)
+        if _db_session and _db_session is not _external_db_session:
+            _db_session.close()
+            _db_session = None
+
+
+@tool
+def get_spending_summary() -> str:
+    """
+    Get a summary of spending totals grouped by category.
+
+    Returns:
+        A formatted summary showing total spending per category for debit transactions.
+    """
+    writer = get_stream_writer()
+    writer("Retrieving spending summary by category")
+
+    if "user_id" not in _user_context:
+        return "Error: User context not set. Please authenticate first."
+
+    db = get_db_session()
+    user_id = _user_context["user_id"]
+
+    try:
+        writer("Calculating spending summary from database")
+        summary = transaction_service.get_spending_summary(user_id=user_id, db=db)
+
+        if not summary:
+            writer("No spending data found")
+            return "No spending data found. No transactions have been categorized yet."
+
+        writer(f"Found spending data for {len(summary)} categories")
+
+        result_lines = ["Spending Summary by Category:\n"]
+        total_spending = sum(summary.values())
+        for category, amount in sorted(
+            summary.items(), key=lambda x: x[1], reverse=True
+        ):
+            percentage = (amount / total_spending * 100) if total_spending > 0 else 0
+            result_lines.append(f"- {category}: {amount} ({percentage:.1f}%)")
+
+        result_lines.append(f"\nTotal Spending: {total_spending}")
+        result = "\n".join(result_lines)
+        writer("Spending summary retrieved successfully")
+        return result
+
+    except Exception as e:
+        logger.error(
+            "Error retrieving spending summary", extra={"error": str(e)}, exc_info=True
+        )
+        return f"Error retrieving spending summary: {str(e)}"
+    finally:
+        global _db_session, _external_db_session
+        # Only close the session if we created it ourselves (not passed from outside)
+        if _db_session and _db_session is not _external_db_session:
+            _db_session.close()
+            _db_session = None
+
+
+TOOL_NAMES = [
+    "categorize_transaction",
+    "create_budget_rule",
+    "save_user_profile",
+    "get_user_transactions",
+    "get_user_budget_rules",
+    "get_spending_summary",
+]
