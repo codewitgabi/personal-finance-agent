@@ -1,9 +1,70 @@
 import json
 import uuid
-from typing import AsyncGenerator, Any
-from ai.agent import get_agent
+import time
+from typing import AsyncGenerator, Any, Optional
+from langchain_core.messages import HumanMessage
+from ai.agent import get_agent, model
 from ai.tools import set_user_context, TOOL_NAMES
 from api.v1.utils.dependencies import get_db
+from api.v1.services.chat_message_service import chat_message_service
+from api.v1.services.conversation_service import conversation_service
+from api.v1.models.chat_message import MessageRole, MessageStatus, FinishReason
+
+# Model identifier - should match the model in ai/agent.py
+MODEL_NAME = "gemini-2.5-flash"
+MODEL_TEMPERATURE = 0.8
+
+
+async def generate_conversation_title(user_message: str, assistant_message: str) -> str:
+    """
+    Generate a conversation title using the AI model based on the first exchange.
+
+    Args:
+        user_message: First user message in the conversation
+        assistant_message: First assistant response
+
+    Returns:
+        Generated title string
+    """
+    try:
+        title_prompt = f"""Based on this conversation exchange, generate a concise title (max 6 words) that summarizes the topic:
+
+User: {user_message[:200]}
+Assistant: {assistant_message[:200]}
+
+Title:"""
+
+        response = await model.ainvoke([HumanMessage(content=title_prompt)])
+
+        # Extract title from response
+        if hasattr(response, "content"):
+            title = response.content
+        elif isinstance(response, str):
+            title = response
+        else:
+            title = str(response)
+
+        # Clean up the title
+        title = title.strip()
+        # Remove quotes if present
+        if title.startswith('"') and title.endswith('"'):
+            title = title[1:-1]
+        if title.startswith("'") and title.endswith("'"):
+            title = title[1:-1]
+
+        # Remove "Title:" prefix if present
+        if title.lower().startswith("title:"):
+            title = title[6:].strip()
+
+        # Limit to 200 characters
+        if len(title) > 200:
+            title = title[:197] + "..."
+
+        return title if title else "New Conversation"
+    except Exception as e:
+        # Fallback to a simple title if generation fails
+        words = user_message.split()[:6]
+        return " ".join(words) if words else "New Conversation"
 
 
 def format_sse_event(data: dict) -> str:
@@ -172,7 +233,7 @@ async def stream_agent_response(
     message: str, thread_id: str, user_id: str
 ) -> AsyncGenerator[str, None]:
     """
-    Stream AI agent responses as Server-Sent Events (SSE).
+    Stream AI agent responses as Server-Sent Events (SSE) and save messages to database.
 
     Sets up the user context, initializes the agent, and streams responses
     in real-time. Handles three types of events:
@@ -182,7 +243,7 @@ async def stream_agent_response(
 
     The function yields SSE-formatted events that can be consumed by a client
     for real-time updates. Automatically manages database connections and
-    handles errors gracefully.
+    handles errors gracefully. All messages are saved to the database.
 
     Args:
         message: User's input message to send to the AI agent.
@@ -211,13 +272,54 @@ async def stream_agent_response(
     Note:
         The database connection is automatically closed in the finally block.
         User context is set before streaming begins.
+        Messages are saved to the database during streaming.
     """
     db = next(get_db())
+    start_time = time.time()
+    user_message_id: Optional[str] = None
+    assistant_message_id: Optional[str] = None
+    assistant_content = ""
+    tool_calls = []
+    final_thread_id = thread_id or str(uuid.uuid4())
+    conversation = None
+    conversation_id: Optional[str] = None
+    is_new_conversation = False
 
     try:
+        # Get or create conversation
+        if thread_id:
+            conversation = conversation_service.get_conversation_by_thread_id(
+                user_id=user_id, thread_id=thread_id, db=db
+            )
+
+        if not conversation:
+            # Create new conversation
+            is_new_conversation = True
+            conversation = conversation_service.create_conversation(
+                user_id=user_id,
+                thread_id=final_thread_id,
+                title=None,  # Will be generated after first exchange
+                db=db,
+            )
+
+        # Store conversation_id to avoid detached object issues
+        conversation_id = conversation.id
+
+        # Save user message
+        user_message = chat_message_service.create_message(
+            conversation_id=conversation_id,
+            role=MessageRole.USER,
+            content=message,
+            model=MODEL_NAME,
+            temperature=MODEL_TEMPERATURE,
+            status=MessageStatus.COMPLETED,
+            db=db,
+        )
+        user_message_id = user_message.id
+
         set_user_context(user_id, db)
         agent = get_agent()
-        config = {"configurable": {"thread_id": thread_id or str(uuid.uuid4())}}
+        config = {"configurable": {"thread_id": final_thread_id}}
 
         async for event in agent.astream(
             {"messages": [("user", message)]},
@@ -231,6 +333,32 @@ async def stream_agent_response(
                 if mode == "messages":
                     message_chunk, metadata = data
                     if hasattr(message_chunk, "content") and message_chunk.content:
+                        # Extract text content
+                        chunk_text = extract_text_from_message(message_chunk)
+                        if chunk_text:
+                            assistant_content += chunk_text
+
+                            # Create assistant message if it doesn't exist
+                            if assistant_message_id is None:
+                                assistant_message = chat_message_service.create_message(
+                                    conversation_id=conversation_id,
+                                    role=MessageRole.ASSISTANT,
+                                    content=assistant_content,
+                                    parent_message_id=user_message_id,
+                                    model=MODEL_NAME,
+                                    temperature=MODEL_TEMPERATURE,
+                                    status=MessageStatus.PENDING,
+                                    db=db,
+                                )
+                                assistant_message_id = assistant_message.id
+                            else:
+                                # Update existing message with accumulated content
+                                chat_message_service.update_message(
+                                    message_id=assistant_message_id,
+                                    content=assistant_content,
+                                    db=db,
+                                )
+
                         yield format_sse_event(
                             {"type": "text", "content": message_chunk.content}
                         )
@@ -243,6 +371,8 @@ async def stream_agent_response(
 
                         tool_info = extract_tool_info(node_name, node_data)
                         if tool_info:
+                            # Track tool calls for metadata
+                            tool_calls.append({"node": node_name, "info": tool_info})
                             yield format_sse_event(
                                 {"type": "tool_update", "content": tool_info}
                             )
@@ -251,9 +381,125 @@ async def stream_agent_response(
                 elif mode == "custom":
                     yield format_sse_event({"type": "custom", "content": data})
 
-        yield format_sse_event({"type": "done", "data": {}})
+        # Calculate latency
+        latency_ms = int((time.time() - start_time) * 1000)
+
+        # Finalize assistant message
+        if assistant_message_id:
+            # Token usage would need to be extracted from response metadata
+            # For now, set to None as LangChain streaming doesn't expose this directly
+            prompt_tokens = None
+            completion_tokens = None
+            total_tokens = None
+
+            # Prepare metadata
+            message_metadata = {}
+            if tool_calls:
+                message_metadata["tool_calls"] = tool_calls
+
+            chat_message_service.update_message(
+                message_id=assistant_message_id,
+                status=MessageStatus.COMPLETED,
+                finish_reason=FinishReason.STOP,
+                latency_ms=latency_ms,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                message_metadata=message_metadata if message_metadata else None,
+                db=db,
+            )
+        elif assistant_content:
+            # Create assistant message if we have content but no message yet
+            chat_message_service.create_message(
+                conversation_id=conversation_id,
+                role=MessageRole.ASSISTANT,
+                content=assistant_content,
+                parent_message_id=user_message_id,
+                model=MODEL_NAME,
+                temperature=MODEL_TEMPERATURE,
+                status=MessageStatus.COMPLETED,
+                finish_reason=FinishReason.STOP,
+                latency_ms=latency_ms,
+                message_metadata={"tool_calls": tool_calls} if tool_calls else None,
+                db=db,
+            )
+
+        # Generate title for new conversations after first exchange
+        if is_new_conversation and assistant_content:
+            # Reload conversation to ensure it's bound to the session
+            conversation = conversation_service.get_conversation_by_id(
+                conversation_id=conversation_id, user_id=user_id, db=db
+            )
+            if conversation and not conversation.title:
+                try:
+                    title = await generate_conversation_title(
+                        message, assistant_content
+                    )
+                    conversation_service.update_conversation_title(
+                        conversation_id=conversation_id, title=title, db=db
+                    )
+                except Exception as e:
+                    # If title generation fails, use fallback
+                    words = message.split()[:6]
+                    fallback_title = " ".join(words) if words else "New Conversation"
+                    conversation_service.update_conversation_title(
+                        conversation_id=conversation_id, title=fallback_title, db=db
+                    )
+
+        # Reload conversation to get the latest title and thread_id for the response
+        conversation = conversation_service.get_conversation_by_id(
+            conversation_id=conversation_id, user_id=user_id, db=db
+        )
+        conversation_title = conversation.title if conversation else None
+        conversation_thread_id = (
+            conversation.thread_id if conversation else final_thread_id
+        )
+
+        yield format_sse_event(
+            {
+                "type": "done",
+                "data": {
+                    "thread_id": conversation_thread_id,
+                    "title": conversation_title or "New Conversation",
+                },
+            }
+        )
     except Exception as e:
-        error_event = {"type": "error", "data": {"message": str(e)}}
+        # Update assistant message status to error if it exists
+        if assistant_message_id:
+            try:
+                chat_message_service.update_message(
+                    message_id=assistant_message_id,
+                    status=MessageStatus.ERROR,
+                    finish_reason=FinishReason.ERROR,
+                    message_metadata={"error": str(e)},
+                    db=db,
+                )
+            except:
+                pass  # Don't fail if update fails
+
+        # Try to get conversation info for error response
+        error_data = {"message": str(e)}
+        if conversation_id:
+            try:
+                conversation = conversation_service.get_conversation_by_id(
+                    conversation_id=conversation_id, user_id=user_id, db=db
+                )
+                if conversation:
+                    error_data["thread_id"] = conversation.thread_id
+                    error_data["title"] = conversation.title or "New Conversation"
+                else:
+                    error_data["thread_id"] = final_thread_id
+                    error_data["title"] = "New Conversation"
+            except:
+                # If we can't get conversation, at least include thread_id
+                error_data["thread_id"] = final_thread_id
+                error_data["title"] = "New Conversation"
+        else:
+            error_data["thread_id"] = final_thread_id
+            error_data["title"] = "New Conversation"
+
+        error_event = {"type": "error", "data": error_data}
         yield format_sse_event(error_event)
     finally:
         db.close()

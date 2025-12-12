@@ -10,6 +10,7 @@ from api.v1.models.abstract_base import AbstractBaseModel
 if TYPE_CHECKING:
     from api.v1.models.transaction import Transaction
     from api.v1.models.budget_rule import BudgetRule
+    from api.v1.models.conversation import Conversation
 
 
 class User(AbstractBaseModel):
@@ -31,4 +32,7 @@ class User(AbstractBaseModel):
     )
     budget_rules: Mapped[list[BudgetRule]] = relationship(
         "BudgetRule", back_populates="user", cascade="all, delete-orphan"
+    )
+    conversations: Mapped[list[Conversation]] = relationship(
+        "Conversation", back_populates="user", cascade="all, delete-orphan"
     )
